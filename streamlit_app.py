@@ -1,7 +1,7 @@
-# streamlit_app.py — CardBlur (Streamlit, Upload + Live WebRTC with anti-flicker)
+# streamlit_app.py — CardBlur (Streamlit, Upload + Live WebRTC with anti-flicker, fast drop-off)
 # - Upload image OR use true live camera (no snapshots)
 # - Modes: Text only / Face only / Text + Face / Whole card
-# - Live path has temporal smoothing to prevent on/off blinking
+# - Live path has temporal smoothing to prevent flicker, tuned to drop blur quickly
 
 import os, io, pathlib, urllib.request, threading
 import numpy as np
@@ -43,16 +43,16 @@ UPLOAD_IOU    = float(os.environ.get("UPLOAD_IOU", 0.5))
 TILE_SIZE     = int(os.environ.get("TILE_SIZE", 960))
 TILE_OVERLAP  = float(os.environ.get("TILE_OVERLAP", 0.20))
 
-# Live options
-LIVE_DETECT_EVERY   = int(os.environ.get("LIVE_DETECT_EVERY", "2"))          # process every Nth frame
+# Live options (FAST DROP-OFF DEFAULTS)
+LIVE_DETECT_EVERY   = int(os.environ.get("LIVE_DETECT_EVERY", "1"))   # run detect every frame (was 2)
 LIVE_ALWAYS_BLUR_DOC= os.environ.get("LIVE_ALWAYS_BLUR_DOC", "1") == "1"     # Whole card: blur every detected doc box
 LIVE_DEBUG          = os.environ.get("LIVE_DEBUG", "0") == "1"               # draw counts on the frame
 
 # --- anti-flicker / smoothing (frames) ---
-LIVE_HOLD_FRAMES    = int(os.environ.get("LIVE_HOLD_FRAMES", 24))  # keep blur ~1–2s
-LIVE_WARMUP_FRAMES  = int(os.environ.get("LIVE_WARMUP_FRAMES", 2))  # need to see a box this many times first
-LIVE_MATCH_IOU      = float(os.environ.get("LIVE_MATCH_IOU", 0.35)) # how close boxes must be to match
-LIVE_SMOOTH         = float(os.environ.get("LIVE_SMOOTH", 0.5))     # 0..1, higher = steadier box position
+LIVE_HOLD_FRAMES    = int(os.environ.get("LIVE_HOLD_FRAMES", "6"))   # keep blur ~0.3–0.6s, was 24
+LIVE_WARMUP_FRAMES  = int(os.environ.get("LIVE_WARMUP_FRAMES", "2"))  # need to see a box this many times first
+LIVE_MATCH_IOU      = float(os.environ.get("LIVE_MATCH_IOU", "0.35")) # how close boxes must be to match
+LIVE_SMOOTH         = float(os.environ.get("LIVE_SMOOTH", "0.35"))    # less laggy than 0.5
 
 # Text post-process
 TEXT_DILATE_FRAC    = float(os.environ.get("TEXT_DILATE_FRAC", 0.010))
