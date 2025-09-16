@@ -1,7 +1,7 @@
-# streamlit_app.py — CardBlur (Streamlit, Upload + Live WebRTC, live-friendly)
-# - Upload image OR true live camera
+# streamlit_app.py — CardBlur (Streamlit, Upload + Live WebRTC with anti-flicker)
+# - Upload image OR use true live camera (no snapshots)
 # - Modes: Text only / Face only / Text + Face / Whole card
-# - Live path uses a lighter, single-pass detector and (optionally) always blurs the card
+# - Live path has temporal smoothing to prevent on/off blinking
 
 import os, io, pathlib, urllib.request, threading
 import numpy as np
@@ -44,9 +44,15 @@ TILE_SIZE     = int(os.environ.get("TILE_SIZE", 960))
 TILE_OVERLAP  = float(os.environ.get("TILE_OVERLAP", 0.20))
 
 # Live options
-LIVE_DETECT_EVERY = int(os.environ.get("LIVE_DETECT_EVERY", "2"))         # process every Nth frame
-LIVE_ALWAYS_BLUR_DOC = os.environ.get("LIVE_ALWAYS_BLUR_DOC", "1") == "1" # if Whole card: blur every detected doc box
-LIVE_DEBUG = os.environ.get("LIVE_DEBUG", "0") == "1"                      # draw counts on the frame
+LIVE_DETECT_EVERY   = int(os.environ.get("LIVE_DETECT_EVERY", "2"))          # process every Nth frame
+LIVE_ALWAYS_BLUR_DOC= os.environ.get("LIVE_ALWAYS_BLUR_DOC", "1") == "1"     # Whole card: blur every detected doc box
+LIVE_DEBUG          = os.environ.get("LIVE_DEBUG", "0") == "1"               # draw counts on the frame
+
+# --- anti-flicker / smoothing (frames) ---
+LIVE_HOLD_FRAMES    = int(os.environ.get("LIVE_HOLD_FRAMES", 24))  # keep blur ~1–2s
+LIVE_WARMUP_FRAMES  = int(os.environ.get("LIVE_WARMUP_FRAMES", 2))  # need to see a box this many times first
+LIVE_MATCH_IOU      = float(os.environ.get("LIVE_MATCH_IOU", 0.35)) # how close boxes must be to match
+LIVE_SMOOTH         = float(os.environ.get("LIVE_SMOOTH", 0.5))     # 0..1, higher = steadier box position
 
 # Text post-process
 TEXT_DILATE_FRAC    = float(os.environ.get("TEXT_DILATE_FRAC", 0.010))
@@ -396,18 +402,13 @@ def run_upload(model, names, bgr_image: np.ndarray, mode: str = "both") -> np.nd
         blur_region(bgr_image, x1, y1, x2, y2)
     return bgr_image
 
-# ---------- Live path (lighter & more permissive) ----------
-def run_live(model, names, bgr_image: np.ndarray, mode: str) -> np.ndarray:
-    """
-    Live uses a single forward pass (no tiling/flip) for speed.
-    If 'Whole card' is selected, we blur every detected doc box (padded).
-    """
+# ---------- Live helpers ----------
+def live_get_targets(model, names, bgr_image: np.ndarray, mode: str):
     rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
     preds = _predict(model, names, rgb, CONF, IOU)
     doc_boxes, face_boxes, text_boxes = _gather_boxes(preds)
     H, W = bgr_image.shape[:2]
 
-    # optional debug overlay
     if LIVE_DEBUG:
         dbg = f"doc:{len(doc_boxes)} face:{len(face_boxes)} text:{len(text_boxes)}"
         cv2.putText(bgr_image, dbg, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (32, 255, 32), 2, cv2.LINE_AA)
@@ -429,9 +430,54 @@ def run_live(model, names, bgr_image: np.ndarray, mode: str) -> np.ndarray:
         merged = text_boxes + face_boxes
         targets = [merged[i] for i in nms_boxes(merged, None, iou_th=0.3)] if merged else []
 
-    for (x1, y1, x2, y2) in targets:
-        blur_region(bgr_image, x1, y1, x2, y2)
-    return bgr_image
+    return targets
+
+class BoxTracker:
+    """
+    Stabilize targets across frames:
+    - matches by IoU
+    - EMA-smooths box coords
+    - holds boxes for N frames after last seen (prevents flicker)
+    """
+    def __init__(self, hold_frames=24, warmup=2, match_iou=0.35, smooth=0.5):
+        self.hold = hold_frames
+        self.warmup = warmup
+        self.match_iou = match_iou
+        self.smooth = smooth
+        self.tracks = []  # each: {box:(x1,y1,x2,y2), ttl:int, hits:int}
+
+    def _ema(self, a, b):
+        return int(a * self.smooth + b * (1.0 - self.smooth))
+
+    def update(self, new_boxes):
+        # decay existing
+        for t in self.tracks:
+            t["ttl"] -= 1
+
+        # greedy match
+        for b in new_boxes:
+            best = None
+            best_iou = 0.0
+            for t in self.tracks:
+                i = iou(t["box"], b)
+                if i > best_iou:
+                    best_iou = i
+                    best = t
+            if best is not None and best_iou >= self.match_iou:
+                x1 = self._ema(best["box"][0], b[0])
+                y1 = self._ema(best["box"][1], b[1])
+                x2 = self._ema(best["box"][2], b[2])
+                y2 = self._ema(best["box"][3], b[3])
+                best["box"] = (x1, y1, x2, y2)
+                best["ttl"] = self.hold
+                best["hits"] += 1
+            else:
+                self.tracks.append({"box": b, "ttl": self.hold, "hits": 1})
+
+        # keep alive
+        self.tracks = [t for t in self.tracks if t["ttl"] > 0]
+        # matured tracks are shown
+        return [t["box"] for t in self.tracks if t["hits"] >= self.warmup]
 
 # =========================
 # Load model once
@@ -468,14 +514,29 @@ with tab_live:
         class LiveProcessor(VideoProcessorBase):
             def __init__(self):
                 self.frame_id = 0
+                self.tracker = BoxTracker(
+                    hold_frames=LIVE_HOLD_FRAMES,
+                    warmup=LIVE_WARMUP_FRAMES,
+                    match_iou=LIVE_MATCH_IOU,
+                    smooth=LIVE_SMOOTH,
+                )
+
             def recv(self, frame):
                 self.frame_id += 1
                 img = frame.to_ndarray(format="bgr24")
-                if self.frame_id % LIVE_DETECT_EVERY != 0:
-                    return frame  # pass-through to keep FPS smooth
-                with _infer_lock:
-                    out = run_live(model, names, img, blur_mode)
-                return av.VideoFrame.from_ndarray(out, format="bgr24")
+
+                # every Nth frame: run detection; otherwise reuse/decay previous boxes
+                if self.frame_id % LIVE_DETECT_EVERY == 0:
+                    with _infer_lock:
+                        new_targets = live_get_targets(model, names, img, blur_mode)
+                    matured = self.tracker.update(new_targets)
+                else:
+                    matured = self.tracker.update([])
+
+                for (x1, y1, x2, y2) in matured:
+                    blur_region(img, x1, y1, x2, y2)
+
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
 
         rtc_cfg = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
         webrtc_streamer(
