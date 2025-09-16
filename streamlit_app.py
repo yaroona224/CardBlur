@@ -1,7 +1,7 @@
 # streamlit_app.py — CardBlur (Streamlit, Upload + Live WebRTC)
 # - Upload image OR use true live camera (no snapshots)
 # - Modes: Text only / Face only / Text + Face / Whole card
-# - Works on Streamlit Cloud (no Flask)
+# - Works on Streamlit Cloud
 
 import os, io, pathlib, urllib.request, threading
 from typing import List, Tuple
@@ -10,18 +10,19 @@ import cv2
 from PIL import Image
 import streamlit as st
 
-# -------- optional live video deps --------
+# -------- live video deps --------
+HAS_WEBRTC = False
+HAS_AV = False
 try:
-    from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase, RTCConfiguration
     HAS_WEBRTC = True
 except Exception:
-    HAS_WEBRTC = False
-
+    pass
 try:
-    import av  # required by streamlit-webrtc to return frames
+    import av  # required by streamlit-webrtc
     HAS_AV = True
 except Exception:
-    HAS_AV = False
+    pass
 
 _infer_lock = threading.Lock()  # YOLO safety across frames
 
@@ -79,11 +80,11 @@ st.caption("AI-powered privacy protection for IDs & passports — by Shatha Khaw
 
 with st.sidebar:
     st.header("Options")
-    mode = st.radio("What to blur?", ["Text only", "Face only", "Text + Face", "Whole card"], index=2)
+    blur_mode = st.radio("What to blur?", ["Text only", "Face only", "Text + Face", "Whole card"], index=2)
     st.caption("Tip: If your model uses different class names, I auto-match common labels.")
 
 # =========================
-# Helpers (ported from your Flask code)
+# Helpers (ported)
 # =========================
 def make_odd(n): return n if n % 2 == 1 else n + 1
 def compute_kernel(w, h):
@@ -172,10 +173,7 @@ def nms_boxes(boxes, scores=None, iou_th=0.5):
     if not boxes:
         return []
     boxes = np.array(boxes, dtype=float)
-    if scores is None:
-        scores = np.ones(len(boxes), dtype=float)
-    else:
-        scores = np.array(scores, dtype=float)
+    scores = np.ones(len(boxes), dtype=float) if scores is None else np.array(scores, dtype=float)
     order = scores.argsort()[::-1]
     keep = []
     def _iou(a, b):
@@ -190,15 +188,10 @@ def nms_boxes(boxes, scores=None, iou_th=0.5):
         ub = max(0, bx2 - bx1) * max(0, by2 - by1)
         return inter / (ua + ub - inter + 1e-6)
     while order.size > 0:
-        i = int(order[0])
-        keep.append(i)
+        i = int(order[0]); keep.append(i)
         if order.size == 1: break
         rest = order[1:]
-        suppress = []
-        for j in rest:
-            if _iou(boxes[i], boxes[int(j)]) > iou_th:
-                suppress.append(j)
-        order = np.array([k for k in rest if k not in suppress])
+        order = np.array([k for k in rest if _iou(boxes[i], boxes[int(k)]) <= iou_th])
     return keep
 
 # =========================
@@ -252,6 +245,7 @@ def _predict(model, names, img_rgb, conf, iou):
 
     def npint(x): return x.cpu().numpy().astype(int)
     def npfloat(x): return x.cpu().numpy().astype(float)
+
     try:
         if hasattr(res, "boxes") and res.boxes is not None and len(res.boxes) > 0:
             xyxy = npint(res.boxes.xyxy)
@@ -284,8 +278,7 @@ def _predict_tiled(model, names, img_rgb, conf, iou):
     out = []
     for y in range(0, H, step_y):
         for x in range(0, W, step_x):
-            x2 = min(x + ts, W)
-            y2 = min(y + ts, H)
+            x2 = min(x + ts, W); y2 = min(y + ts, H)
             tile = img_rgb[y:y2, x:x2]
             preds = _predict(model, names, tile, conf, iou)
             for (bx1, by1, bx2, by2), label, score in preds:
@@ -298,8 +291,7 @@ def _predict_tta_flip(model, names, img_rgb, conf, iou):
     preds = _predict(model, names, flip, conf, iou)
     mapped = []
     for (x1, y1, x2, y2), label, score in preds:
-        nx1 = W - x2
-        nx2 = W - x1
+        nx1 = W - x2; nx2 = W - x1
         mapped.append(((nx1, y1, nx2, y2), label, score))
     return mapped
 
@@ -503,7 +495,7 @@ with tab_upload:
         pil = Image.open(file).convert("RGB")
         bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
         with _infer_lock:
-            out = run_upload(model, names, bgr.copy(), mode)
+            out = run_upload(model, names, bgr.copy(), blur_mode)
         st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), caption="Blurred", use_column_width=True)
         ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         if ok:
@@ -511,11 +503,11 @@ with tab_upload:
 
 with tab_live:
     if not HAS_WEBRTC or not HAS_AV:
-        st.info("Install streamlit-webrtc in requirements to enable live video.")
+        st.info("Install streamlit-webrtc and av in requirements to enable live video.")
     else:
-        LIVE_DETECT_EVERY = int(os.getenv("LIVE_DETECT_EVERY", "2"))  # process every Nth frame to save CPU
+        LIVE_DETECT_EVERY = int(os.getenv("LIVE_DETECT_EVERY", "2"))  # process every Nth frame
 
-        class LiveTransformer(VideoTransformerBase):
+        class LiveProcessor(VideoProcessorBase):
             def __init__(self):
                 self.frame_id = 0
 
@@ -523,10 +515,9 @@ with tab_live:
                 self.frame_id += 1
                 img = frame.to_ndarray(format="bgr24")
                 if self.frame_id % LIVE_DETECT_EVERY != 0:
-                    # pass-through for smoother FPS
-                    return frame
+                    return frame  # pass-through to keep FPS smooth
                 with _infer_lock:
-                    out = run_upload(model, names, img, mode)
+                    out = run_upload(model, names, img, blur_mode)
                 return av.VideoFrame.from_ndarray(out, format="bgr24")
 
         rtc_cfg = RTCConfiguration(
@@ -535,10 +526,10 @@ with tab_live:
 
         webrtc_streamer(
             key="cardblur-live",
-            mode="SENDRECV",
+            mode=WebRtcMode.SENDRECV,                 # enum (required)
             rtc_configuration=rtc_cfg,
             media_stream_constraints={"video": True, "audio": False},
-            video_transformer_factory=LiveTransformer,
+            video_processor_factory=LiveProcessor,    # new API
         )
 
 # Debug: show labels
