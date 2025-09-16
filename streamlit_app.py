@@ -1,10 +1,9 @@
-# streamlit_app.py — CardBlur (Streamlit, Upload + Live WebRTC)
-# - Upload image OR use true live camera (no snapshots)
+# streamlit_app.py — CardBlur (Streamlit, Upload + Live WebRTC, live-friendly)
+# - Upload image OR true live camera
 # - Modes: Text only / Face only / Text + Face / Whole card
-# - Works on Streamlit Cloud
+# - Live path uses a lighter, single-pass detector and (optionally) always blurs the card
 
 import os, io, pathlib, urllib.request, threading
-from typing import List, Tuple
 import numpy as np
 import cv2
 from PIL import Image
@@ -44,6 +43,11 @@ UPLOAD_IOU    = float(os.environ.get("UPLOAD_IOU", 0.5))
 TILE_SIZE     = int(os.environ.get("TILE_SIZE", 960))
 TILE_OVERLAP  = float(os.environ.get("TILE_OVERLAP", 0.20))
 
+# Live options
+LIVE_DETECT_EVERY = int(os.environ.get("LIVE_DETECT_EVERY", "2"))         # process every Nth frame
+LIVE_ALWAYS_BLUR_DOC = os.environ.get("LIVE_ALWAYS_BLUR_DOC", "1") == "1" # if Whole card: blur every detected doc box
+LIVE_DEBUG = os.environ.get("LIVE_DEBUG", "0") == "1"                      # draw counts on the frame
+
 # Text post-process
 TEXT_DILATE_FRAC    = float(os.environ.get("TEXT_DILATE_FRAC", 0.010))
 TEXT_MERGE_GAP_FRAC = float(os.environ.get("TEXT_MERGE_GAP_FRAC", 0.010))
@@ -80,11 +84,11 @@ st.caption("AI-powered privacy protection for IDs & passports — by Shatha Khaw
 
 with st.sidebar:
     st.header("Options")
-    blur_mode = st.radio("What to blur?", ["Text only", "Face only", "Text + Face", "Whole card"], index=2)
-    st.caption("Tip: If your model uses different class names, I auto-match common labels.")
+    blur_mode = st.radio("What to blur?", ["Text only", "Face only", "Text + Face", "Whole card"], index=3)
+    st.caption("Tip: 'Whole card' will blur detected card boxes in live mode.")
 
 # =========================
-# Helpers (ported)
+# Helpers
 # =========================
 def make_odd(n): return n if n % 2 == 1 else n + 1
 def compute_kernel(w, h):
@@ -198,11 +202,9 @@ def nms_boxes(boxes, scores=None, iou_th=0.5):
 # Weights + Model
 # =========================
 def ensure_weights() -> str:
-    # 1) repo file
     for p in [BASE_DIR/"best.pt", BASE_DIR/"models"/"best.pt", WEIGHTS_PATH]:
         if p and pathlib.Path(p).exists():
             return str(pathlib.Path(p).resolve())
-    # 2) secret URL
     url = None
     try:
         url = st.secrets.get("WEIGHTS_URL")
@@ -268,33 +270,6 @@ def _predict(model, names, img_rgb, conf, iou):
         pass
     return out
 
-def _predict_tiled(model, names, img_rgb, conf, iou):
-    H, W = img_rgb.shape[:2]
-    ts = min(TILE_SIZE, max(H, W))
-    step_x = int(ts * (1 - TILE_OVERLAP))
-    step_y = int(ts * (1 - TILE_OVERLAP))
-    if step_x <= 0 or step_y <= 0:
-        return _predict(model, names, img_rgb, conf, iou)
-    out = []
-    for y in range(0, H, step_y):
-        for x in range(0, W, step_x):
-            x2 = min(x + ts, W); y2 = min(y + ts, H)
-            tile = img_rgb[y:y2, x:x2]
-            preds = _predict(model, names, tile, conf, iou)
-            for (bx1, by1, bx2, by2), label, score in preds:
-                out.append(((bx1 + x, by1 + y, bx2 + x, by2 + y), label, score))
-    return out
-
-def _predict_tta_flip(model, names, img_rgb, conf, iou):
-    H, W = img_rgb.shape[:2]
-    flip = cv2.flip(img_rgb, 1)
-    preds = _predict(model, names, flip, conf, iou)
-    mapped = []
-    for (x1, y1, x2, y2), label, score in preds:
-        nx1 = W - x2; nx2 = W - x1
-        mapped.append(((nx1, y1, nx2, y2), label, score))
-    return mapped
-
 def _gather_boxes(preds):
     doc_boxes, face_boxes, face_scores, text_boxes, text_scores = [], [], [], [], []
     for (x1,y1,x2,y2), label, score in preds:
@@ -308,6 +283,32 @@ def _gather_boxes(preds):
         keep = nms_boxes(text_boxes, None, iou_th=TEXT_NMS_IOU)
         text_boxes = [text_boxes[i] for i in keep]
     return doc_boxes, face_boxes, text_boxes
+
+# ---------- Upload path (kept) ----------
+def _predict_tiled(model, names, img_rgb, conf, iou):
+    H, W = img_rgb.shape[:2]
+    ts = min(TILE_SIZE, max(H, W))
+    step = int(ts * (1 - TILE_OVERLAP))
+    if step <= 0:
+        return _predict(model, names, img_rgb, conf, iou)
+    out = []
+    for y in range(0, H, step):
+        for x in range(0, W, step):
+            x2 = min(x + ts, W); y2 = min(y + ts, H)
+            preds = _predict(model, names, img_rgb[y:y2, x:x2], conf, iou)
+            for (bx1, by1, bx2, by2), label, score in preds:
+                out.append(((bx1 + x, by1 + y, bx2 + x, by2 + y), label, score))
+    return out
+
+def _predict_tta_flip(model, names, img_rgb, conf, iou):
+    H, W = img_rgb.shape[:2]
+    flip = cv2.flip(img_rgb, 1)
+    preds = _predict(model, names, flip, conf, iou)
+    mapped = []
+    for (x1, y1, x2, y2), label, score in preds:
+        nx1 = W - x2; nx2 = W - x1
+        mapped.append(((nx1, y1, nx2, y2), label, score))
+    return mapped
 
 def _filter_text_geometry(text_boxes, W, H):
     out = []
@@ -328,10 +329,8 @@ def _group_by_rows(boxes, row_tol_px):
     ys.sort()
     groups, cur, last_y = [], [], None
     for yc, i in ys:
-        if last_y is None or abs(yc - last_y) <= row_tol_px:
-            cur.append(i)
-        else:
-            groups.append(cur); cur=[i]
+        if last_y is None or abs(yc - last_y) <= row_tol_px: cur.append(i)
+        else: groups.append(cur); cur=[i]
         last_y = yc
     if cur: groups.append(cur)
     return [[boxes[i] for i in g] for g in groups]
@@ -340,19 +339,14 @@ def _conservative_text(text_boxes, doc_boxes, W, H):
     if not text_boxes: return []
     text_boxes = _filter_text_geometry(text_boxes, W, H)
     if not text_boxes: return []
-
-    px = max(2, int(TEXT_DILATE_FRAC * W))
-    py = max(2, int(TEXT_DILATE_FRAC * H))
+    px = max(2, int(TEXT_DILATE_FRAC * W)); py = max(2, int(TEXT_DILATE_FRAC * H))
     dil = [expand_px(t, px=px, py=py, W=W, H=H) for t in text_boxes]
-
     row_tol = max(3, int(0.012 * H))
     row_groups = _group_by_rows(dil, row_tol_px=row_tol)
-
     gap = int(TEXT_MERGE_GAP_FRAC * max(W, H))
     merged_all = []
     for grp in row_groups:
         merged_all.extend(merge_boxes_overlap_or_near(grp, max_gap_px=gap))
-
     if doc_boxes and merged_all:
         safe = []
         for m in merged_all:
@@ -370,7 +364,6 @@ def _conservative_text(text_boxes, doc_boxes, W, H):
             else:
                 safe.append(m)
         merged_all = safe
-
     if merged_all:
         keep = nms_boxes(merged_all, None, iou_th=0.4)
         merged_all = [merged_all[i] for i in keep]
@@ -378,100 +371,67 @@ def _conservative_text(text_boxes, doc_boxes, W, H):
 
 def run_upload(model, names, bgr_image: np.ndarray, mode: str = "both") -> np.ndarray:
     rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-
     preds = []
     preds += _predict(model, names, rgb, UPLOAD_CONF, UPLOAD_IOU)
     preds += _predict_tiled(model, names, rgb, UPLOAD_CONF, UPLOAD_IOU)
     preds += _predict_tta_flip(model, names, rgb, UPLOAD_CONF, UPLOAD_IOU)
-
     doc_boxes, face_boxes, text_boxes = _gather_boxes(preds)
-
-    # (Optional) OCR fusion
-    if USE_OCR:
-        try:
-            ocr_boxes = _ocr_boxes_multi(rgb)
-        except Exception:
-            ocr_boxes = []
-        if ocr_boxes:
-            if doc_boxes:
-                ocr_boxes = [b for b in ocr_boxes if any(contains(d, center(*b)) for d in doc_boxes)]
-            combined = text_boxes + ocr_boxes
-            keep = nms_boxes(combined, None, iou_th=0.4)
-            text_boxes = [combined[i] for i in keep]
-
     H, W = bgr_image.shape[:2]
     if doc_boxes:
         text_boxes = [t for t in text_boxes if any(contains(d, center(*t)) for d in doc_boxes)]
         face_boxes = [f for f in face_boxes if any(contains(d, center(*f)) for d in doc_boxes)]
-
     text_boxes = _conservative_text(text_boxes, doc_boxes, W, H)
 
     m = (mode or "both").lower()
-    if m == "text only" or m == "text":
-        targets = text_boxes
-    elif m == "face only" or m == "face":
-        targets = face_boxes
-    elif m == "text + face" or m == "both":
+    if m in ("text only", "text"): targets = text_boxes
+    elif m in ("face only", "face"): targets = face_boxes
+    elif m in ("text + face", "both"):
         merged = text_boxes + face_boxes
         targets = [merged[i] for i in nms_boxes(merged, None, iou_th=0.3)] if merged else []
-    elif m == "whole card" or m == "doc":
+    elif m in ("whole card", "doc"):
         targets = [pad_box(d, DOC_PAD_FRAC, W, H) for d in doc_boxes]
     else:
         targets = []
-
     for (x1, y1, x2, y2) in targets:
         blur_region(bgr_image, x1, y1, x2, y2)
     return bgr_image
 
-# (Optional) OCR helpers (only used if USE_OCR=1 and paddleocr installed)
-def _ocr_boxes_single(ocr_engine, img_rgb):
-    try:
-        result = ocr_engine.ocr(img_rgb, cls=True)
-    except TypeError:
-        result = ocr_engine.ocr(img_rgb)
-    except Exception:
-        return []
-    boxes = []
-    if not result: return boxes
-    for line in result[0]:
-        quad, info = line
-        if isinstance(info, (list, tuple)) and len(info) >= 2:
-            conf = float(info[1]) if info[1] is not None else 1.0
-        elif isinstance(info, dict) and "score" in info:
-            conf = float(info["score"])
-        else:
-            conf = 1.0
-        if conf < OCR_MIN_CONF:
-            continue
-        xs = [int(p[0]) for p in quad]; ys = [int(p[1]) for p in quad]
-        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-        boxes.append((x1 - OCR_EXPAND_PX, y1 - OCR_EXPAND_PX, x2 + OCR_EXPAND_PX, y2 + OCR_EXPAND_PX))
-    return boxes
+# ---------- Live path (lighter & more permissive) ----------
+def run_live(model, names, bgr_image: np.ndarray, mode: str) -> np.ndarray:
+    """
+    Live uses a single forward pass (no tiling/flip) for speed.
+    If 'Whole card' is selected, we blur every detected doc box (padded).
+    """
+    rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    preds = _predict(model, names, rgb, CONF, IOU)
+    doc_boxes, face_boxes, text_boxes = _gather_boxes(preds)
+    H, W = bgr_image.shape[:2]
 
-def _ocr_boxes_multi(img_rgb):
-    if not USE_OCR:
-        return []
-    try:
-        from paddleocr import PaddleOCR
-    except Exception:
-        return []
-    boxes = []
-    langs = [s.strip() for s in OCR_LANG.split(",") if s.strip()]
-    engines = []
-    for lang in langs:
-        try:
-            try:
-                engines.append(PaddleOCR(lang=lang, use_textline_orientation=True))
-            except TypeError:
-                engines.append(PaddleOCR(lang=lang, use_angle_cls=True))
-        except Exception:
-            pass
-    for eng in engines:
-        boxes.extend(_ocr_boxes_single(eng, img_rgb))
-    if boxes:
-        keep = nms_boxes(boxes, None, iou_th=0.4)
-        boxes = [boxes[i] for i in keep]
-    return boxes
+    # optional debug overlay
+    if LIVE_DEBUG:
+        dbg = f"doc:{len(doc_boxes)} face:{len(face_boxes)} text:{len(text_boxes)}"
+        cv2.putText(bgr_image, dbg, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (32, 255, 32), 2, cv2.LINE_AA)
+
+    m = (mode or "").lower()
+    if m in ("whole card", "doc"):
+        if LIVE_ALWAYS_BLUR_DOC:
+            targets = [pad_box(d, DOC_PAD_FRAC, W, H) for d in doc_boxes]
+        else:
+            targets = []
+            for d in doc_boxes:
+                if any(contains(d, center(*f)) for f in face_boxes) and any(contains(d, center(*t)) for t in text_boxes):
+                    targets.append(pad_box(d, DOC_PAD_FRAC, W, H))
+    elif m in ("text only", "text"):
+        targets = text_boxes
+    elif m in ("face only", "face"):
+        targets = face_boxes
+    else:  # "Text + Face"
+        merged = text_boxes + face_boxes
+        targets = [merged[i] for i in nms_boxes(merged, None, iou_th=0.3)] if merged else []
+
+    for (x1, y1, x2, y2) in targets:
+        blur_region(bgr_image, x1, y1, x2, y2)
+    return bgr_image
 
 # =========================
 # Load model once
@@ -505,31 +465,25 @@ with tab_live:
     if not HAS_WEBRTC or not HAS_AV:
         st.info("Install streamlit-webrtc and av in requirements to enable live video.")
     else:
-        LIVE_DETECT_EVERY = int(os.getenv("LIVE_DETECT_EVERY", "2"))  # process every Nth frame
-
         class LiveProcessor(VideoProcessorBase):
             def __init__(self):
                 self.frame_id = 0
-
             def recv(self, frame):
                 self.frame_id += 1
                 img = frame.to_ndarray(format="bgr24")
                 if self.frame_id % LIVE_DETECT_EVERY != 0:
                     return frame  # pass-through to keep FPS smooth
                 with _infer_lock:
-                    out = run_upload(model, names, img, blur_mode)
+                    out = run_live(model, names, img, blur_mode)
                 return av.VideoFrame.from_ndarray(out, format="bgr24")
 
-        rtc_cfg = RTCConfiguration(
-            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-        )
-
+        rtc_cfg = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
         webrtc_streamer(
             key="cardblur-live",
-            mode=WebRtcMode.SENDRECV,                 # enum (required)
+            mode=WebRtcMode.SENDRECV,
             rtc_configuration=rtc_cfg,
             media_stream_constraints={"video": True, "audio": False},
-            video_processor_factory=LiveProcessor,    # new API
+            video_processor_factory=LiveProcessor,
         )
 
 # Debug: show labels
